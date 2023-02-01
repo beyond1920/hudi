@@ -16,9 +16,10 @@
  * limitations under the License.
  */
 
-package org.apache.hudi.source.stats;
+package org.apache.hudi.evaluator;
 
 import org.apache.hudi.common.util.ValidationUtils;
+import org.apache.hudi.source.stats.ColumnStats;
 import org.apache.hudi.util.ExpressionUtils;
 
 import org.apache.flink.table.data.RowData;
@@ -36,10 +37,14 @@ import org.apache.flink.table.types.logical.TimestampType;
 
 import javax.validation.constraints.NotNull;
 
+import java.io.Serializable;
 import java.math.BigDecimal;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
+import java.util.Objects;
 
 /**
  * Tool to evaluate the {@link org.apache.flink.table.expressions.ResolvedExpression}s.
@@ -56,65 +61,90 @@ public class ExpressionEvaluator {
    * @return true if the index row should be considered as a candidate
    */
   public static boolean filterExprs(List<ResolvedExpression> filters, RowData indexRow, RowType.RowField[] queryFields) {
+    Map<String, ColumnStats> columnStatsMapping = convertColumnStats(indexRow, queryFields);
     for (ResolvedExpression filter : filters) {
-      if (!Evaluator.bindCall((CallExpression) filter, indexRow, queryFields).eval()) {
+      if (!Evaluator.bindCall((CallExpression) filter).eval(columnStatsMapping)) {
         return false;
       }
     }
     return true;
   }
 
+  public static Map<String, ColumnStats> convertColumnStats(RowData indexRow, RowType.RowField[] queryFields) {
+    Map<String, ColumnStats> mapping = new LinkedHashMap<>();
+    if (indexRow == null || queryFields == null) {
+      return mapping;
+    }
+    for (int i = 0; i < queryFields.length; i++) {
+      String name = queryFields[i].getName();
+      int startPos = 2 + i * 3;
+      LogicalType colType = queryFields[i].getType();
+      Object minVal = indexRow.isNullAt(startPos) ? null : getValAsJavaObj(indexRow, startPos, colType);
+      Object maxVal = indexRow.isNullAt(startPos + 1) ? null : getValAsJavaObj(indexRow, startPos + 1, colType);
+      long nullCnt = indexRow.getLong(startPos + 2);
+      mapping.put(name, new ColumnStats(minVal, maxVal, nullCnt));
+    }
+    return mapping;
+  }
+
+  private static ColumnStats getColumnStats(Map<String, ColumnStats> columnStatsMap, String name) {
+    ValidationUtils.checkState(columnStatsMap.containsKey(name), "Can not find column " + name);
+    return columnStatsMap.get(name);
+  }
+
   /**
-   * Used for deciding whether the literal values match the column stats.
-   * The evaluator can be nested.
+   * Used for deciding whether the literal values match the column stats or column values. The evaluator can be nested.
    */
-  public abstract static class Evaluator {
+  public abstract static class Evaluator implements Serializable {
+
+    private static final long serialVersionUID = 1L;
+
     // the constant literal value
     protected Object val;
-
-    // column stats
-    protected Object minVal;
-    protected Object maxVal;
-    protected long nullCnt = 0;
 
     // referenced field type
     protected LogicalType type;
 
+    // referenced field name
+    protected String name;
+
+    // referenced field index
+    protected int index;
+
     /**
      * Binds the evaluator with specific call expression.
      *
-     * <p>Three steps to bind the call:
+     * <p>Two steps to bind the call:
      * 1. map the evaluator instance;
      * 2. bind the field reference;
-     * 3. bind the column stats.
      *
      * <p>Normalize the expression to simplify the subsequent decision logic:
      * always put the literal expression in the RHS.
      */
-    public static Evaluator bindCall(CallExpression call, RowData indexRow, RowType.RowField[] queryFields) {
+    public static Evaluator bindCall(CallExpression call) {
       FunctionDefinition funDef = call.getFunctionDefinition();
       List<Expression> childExprs = call.getChildren();
 
       boolean normalized = childExprs.get(0) instanceof FieldReferenceExpression;
-      final Evaluator evaluator;
+      Evaluator evaluator;
 
       if (BuiltInFunctionDefinitions.NOT.equals(funDef)) {
         evaluator = Not.getInstance();
-        Evaluator childEvaluator = bindCall((CallExpression) childExprs.get(0), indexRow, queryFields);
+        Evaluator childEvaluator = bindCall((CallExpression) childExprs.get(0));
         return ((Not) evaluator).bindEvaluator(childEvaluator);
       }
 
       if (BuiltInFunctionDefinitions.AND.equals(funDef)) {
         evaluator = And.getInstance();
-        Evaluator evaluator1 = bindCall((CallExpression) childExprs.get(0), indexRow, queryFields);
-        Evaluator evaluator2 = bindCall((CallExpression) childExprs.get(1), indexRow, queryFields);
+        Evaluator evaluator1 = bindCall((CallExpression) childExprs.get(0));
+        Evaluator evaluator2 = bindCall((CallExpression) childExprs.get(1));
         return ((And) evaluator).bindEvaluator(evaluator1, evaluator2);
       }
 
       if (BuiltInFunctionDefinitions.OR.equals(funDef)) {
         evaluator = Or.getInstance();
-        Evaluator evaluator1 = bindCall((CallExpression) childExprs.get(0), indexRow, queryFields);
-        Evaluator evaluator2 = bindCall((CallExpression) childExprs.get(1), indexRow, queryFields);
+        Evaluator evaluator1 = bindCall((CallExpression) childExprs.get(0));
+        Evaluator evaluator2 = bindCall((CallExpression) childExprs.get(1));
         return ((Or) evaluator).bindEvaluator(evaluator1, evaluator2);
       }
 
@@ -125,20 +155,18 @@ public class ExpressionEvaluator {
         FieldReferenceExpression rExpr = (FieldReferenceExpression) childExprs.get(0);
         evaluator.bindFieldReference(rExpr);
         ((In) evaluator).bindVals(getInLiteralVals(childExprs));
-        return evaluator.bindColStats(indexRow, queryFields, rExpr);
+        return evaluator;
       }
 
       // handle unary operators
       if (BuiltInFunctionDefinitions.IS_NULL.equals(funDef)) {
         FieldReferenceExpression rExpr = (FieldReferenceExpression) childExprs.get(0);
         return IsNull.getInstance()
-            .bindFieldReference(rExpr)
-            .bindColStats(indexRow, queryFields, rExpr);
+            .bindFieldReference(rExpr);
       } else if (BuiltInFunctionDefinitions.IS_NOT_NULL.equals(funDef)) {
         FieldReferenceExpression rExpr = (FieldReferenceExpression) childExprs.get(0);
         return IsNotNull.getInstance()
-            .bindFieldReference(rExpr)
-            .bindColStats(indexRow, queryFields, rExpr);
+            .bindFieldReference(rExpr);
       }
 
       // handle binary operators
@@ -165,45 +193,25 @@ public class ExpressionEvaluator {
           : (ValueLiteralExpression) childExprs.get(0);
       evaluator
           .bindFieldReference(rExpr)
-          .bindVal(vExpr)
-          .bindColStats(indexRow, queryFields, rExpr);
+          .bindVal(vExpr);
       return evaluator;
     }
 
-    public Evaluator bindColStats(
-        RowData indexRow,
-        RowType.RowField[] queryFields,
-        FieldReferenceExpression expr) {
-      int colPos = -1;
-      for (int i = 0; i < queryFields.length; i++) {
-        if (expr.getName().equals(queryFields[i].getName())) {
-          colPos = i;
-        }
-      }
-      ValidationUtils.checkState(colPos != -1, "Can not find column " + expr.getName());
-      int startPos = 2 + colPos * 3;
-      LogicalType colType = queryFields[colPos].getType();
-      Object minVal = indexRow.isNullAt(startPos) ? null : getValAsJavaObj(indexRow, startPos, colType);
-      Object maxVal = indexRow.isNullAt(startPos + 1) ? null : getValAsJavaObj(indexRow, startPos + 1, colType);
-      long nullCnt = indexRow.getLong(startPos + 2);
-
-      this.minVal = minVal;
-      this.maxVal = maxVal;
-      this.nullCnt = nullCnt;
-      return this;
-    }
-
     public Evaluator bindVal(ValueLiteralExpression vExpr) {
-      this.val = ExpressionUtils.getValueFromLiteral(vExpr);
+      val = ExpressionUtils.getValueFromLiteral(vExpr);
       return this;
     }
 
     public Evaluator bindFieldReference(FieldReferenceExpression expr) {
-      this.type = expr.getOutputDataType().getLogicalType();
+      type = expr.getOutputDataType().getLogicalType();
+      name = expr.getName();
+      index = expr.getFieldIndex();
       return this;
     }
 
-    public abstract boolean eval();
+    public abstract boolean eval(Map<String, ColumnStats> columnStatsMap);
+
+    public abstract boolean eval(Object[] values);
   }
 
   /**
@@ -216,14 +224,28 @@ public class ExpressionEvaluator {
     }
 
     @Override
-    public boolean eval() {
-      if (this.minVal == null || this.maxVal == null || this.val == null) {
+    public boolean eval(Map<String, ColumnStats> columnStatsMap) {
+      if (val == null) {
         return false;
       }
-      if (compare(this.minVal, this.val, this.type) > 0) {
+      ColumnStats columnStats = getColumnStats(columnStatsMap, name);
+      Object minVal = columnStats.getMinVal();
+      Object maxVal = columnStats.getMaxVal();
+      if (minVal == null || maxVal == null) {
         return false;
       }
-      return compare(this.maxVal, this.val, this.type) >= 0;
+      if (compare(minVal, val, type) > 0) {
+        return false;
+      }
+      return compare(maxVal, val, type) >= 0;
+    }
+
+    @Override
+    public boolean eval(Object[] values) {
+      if (val == null || values[index] == null) {
+        return false;
+      }
+      return compare(values[index], val, type) == 0;
     }
   }
 
@@ -236,10 +258,23 @@ public class ExpressionEvaluator {
     }
 
     @Override
-    public boolean eval() {
-      // because the bounds are not necessarily a min or max value, this cannot be answered using
-      // them. notEq(col, X) with (X, Y) doesn't guarantee that X is a value in col.
-      return true;
+    public boolean eval(Map<String, ColumnStats> columnStatsMap) {
+      if (val == null) {
+        return false;
+      } else {
+        // because the bounds are not necessarily a min or max value, this cannot be answered using
+        // them. notEq(col, X) with (X, Y) doesn't guarantee that X is a value in col.
+        return true;
+      }
+    }
+
+    @Override
+    public boolean eval(Object[] values) {
+      if (val == null || values[index] == null) {
+        return false;
+      } else {
+        return compare(values[index], val, type) != 0;
+      }
     }
   }
 
@@ -252,8 +287,14 @@ public class ExpressionEvaluator {
     }
 
     @Override
-    public boolean eval() {
-      return this.nullCnt > 0;
+    public boolean eval(Map<String, ColumnStats> columnStatsMap) {
+      ColumnStats columnStats = getColumnStats(columnStatsMap, name);
+      return columnStats.getNullCnt() > 0;
+    }
+
+    @Override
+    public boolean eval(Object[] values) {
+      return values[index] == null;
     }
   }
 
@@ -266,9 +307,15 @@ public class ExpressionEvaluator {
     }
 
     @Override
-    public boolean eval() {
+    public boolean eval(Map<String, ColumnStats> columnStatsMap) {
+      ColumnStats columnStats = getColumnStats(columnStatsMap, name);
       // should consider FLOAT/DOUBLE & NAN
-      return this.minVal != null || this.nullCnt <= 0;
+      return columnStats.getMinVal() != null || columnStats.getNullCnt() <= 0;
+    }
+
+    @Override
+    public boolean eval(Object[] values) {
+      return values[index] != null;
     }
   }
 
@@ -281,11 +328,24 @@ public class ExpressionEvaluator {
     }
 
     @Override
-    public boolean eval() {
-      if (this.minVal == null) {
+    public boolean eval(Map<String, ColumnStats> columnStatsMap) {
+      if (val == null) {
         return false;
       }
-      return compare(this.minVal, this.val, this.type) < 0;
+      ColumnStats columnStats = getColumnStats(columnStatsMap, name);
+      Object minVal = columnStats.getMinVal();
+      if (minVal == null) {
+        return false;
+      }
+      return compare(minVal, val, type) < 0;
+    }
+
+    @Override
+    public boolean eval(Object[] values) {
+      if (val == null || values[index] == null) {
+        return false;
+      }
+      return compare(values[index], val, type) < 0;
     }
   }
 
@@ -298,11 +358,24 @@ public class ExpressionEvaluator {
     }
 
     @Override
-    public boolean eval() {
-      if (this.maxVal == null) {
+    public boolean eval(Map<String, ColumnStats> columnStatsMap) {
+      if (val == null) {
         return false;
       }
-      return compare(this.maxVal, this.val, this.type) > 0;
+      ColumnStats columnStats = getColumnStats(columnStatsMap, name);
+      Object maxVal = columnStats.getMaxVal();
+      if (maxVal == null) {
+        return false;
+      }
+      return compare(maxVal, val, type) > 0;
+    }
+
+    @Override
+    public boolean eval(Object[] values) {
+      if (val == null || values[index] == null) {
+        return false;
+      }
+      return compare(values[index], val, type) > 0;
     }
   }
 
@@ -315,11 +388,24 @@ public class ExpressionEvaluator {
     }
 
     @Override
-    public boolean eval() {
-      if (this.minVal == null) {
+    public boolean eval(Map<String, ColumnStats> columnStatsMap) {
+      if (val == null) {
         return false;
       }
-      return compare(this.minVal, this.val, this.type) <= 0;
+      ColumnStats columnStats = getColumnStats(columnStatsMap, name);
+      Object minVal = columnStats.getMinVal();
+      if (minVal == null) {
+        return false;
+      }
+      return compare(minVal, val, type) <= 0;
+    }
+
+    @Override
+    public boolean eval(Object[] values) {
+      if (val == null || values[index] == null) {
+        return false;
+      }
+      return compare(values[index], val, type) <= 0;
     }
   }
 
@@ -332,11 +418,24 @@ public class ExpressionEvaluator {
     }
 
     @Override
-    public boolean eval() {
-      if (this.maxVal == null) {
+    public boolean eval(Map<String, ColumnStats> columnStatsMap) {
+      if (val == null) {
         return false;
       }
-      return compare(this.maxVal, this.val, this.type) >= 0;
+      ColumnStats columnStats = getColumnStats(columnStatsMap, name);
+      Object maxVal = columnStats.getMaxVal();
+      if (maxVal == null) {
+        return false;
+      }
+      return compare(maxVal, val, type) >= 0;
+    }
+
+    @Override
+    public boolean eval(Object[] values) {
+      if (val == null || values[index] == null) {
+        return false;
+      }
+      return compare(values[index], val, type) >= 0;
     }
   }
 
@@ -351,8 +450,14 @@ public class ExpressionEvaluator {
     private Object[] vals;
 
     @Override
-    public boolean eval() {
-      if (this.minVal == null) {
+    public boolean eval(Map<String, ColumnStats> columnStatsMap) {
+      if (Arrays.stream(vals).anyMatch(Objects::isNull)) {
+        return false;
+      }
+      ColumnStats columnStats = getColumnStats(columnStatsMap, name);
+      Object minVal = columnStats.getMinVal();
+      Object maxVal = columnStats.getMaxVal();
+      if (minVal == null) {
         return false; // values are all null and literalSet cannot contain null.
       }
 
@@ -361,17 +466,30 @@ public class ExpressionEvaluator {
         return true;
       }
 
-      vals = Arrays.stream(vals).filter(v -> compare(this.minVal, v, this.type) <= 0).toArray();
+      vals = Arrays.stream(vals).filter(v -> compare(minVal, v, this.type) <= 0).toArray();
       if (vals.length == 0) { // if all values are less than lower bound, rows cannot match.
         return false;
       }
 
-      vals = Arrays.stream(vals).filter(v -> compare(this.maxVal, v, this.type) >= 0).toArray();
+      vals = Arrays.stream(vals).filter(v -> compare(maxVal, v, this.type) >= 0).toArray();
       if (vals.length == 0) { // if all remaining values are greater than upper bound, rows cannot match.
         return false;
       }
 
       return true;
+    }
+
+    @Override
+    public boolean eval(Object[] values) {
+      if (values[index] == null) {
+        return false;
+      }
+      for (Object val : vals) {
+        if (val != null && compare(values[index], val, type) == 0) {
+          return true;
+        }
+      }
+      return false;
     }
 
     public void bindVals(Object... vals) {
@@ -392,8 +510,13 @@ public class ExpressionEvaluator {
     private Evaluator evaluator;
 
     @Override
-    public boolean eval() {
-      return !this.evaluator.eval();
+    public boolean eval(Map<String, ColumnStats> columnStatsMap) {
+      return !this.evaluator.eval(columnStatsMap);
+    }
+
+    @Override
+    public boolean eval(Object[] values) {
+      return !this.evaluator.eval(values);
     }
 
     public Evaluator bindEvaluator(Evaluator evaluator) {
@@ -413,9 +536,19 @@ public class ExpressionEvaluator {
     private Evaluator[] evaluators;
 
     @Override
-    public boolean eval() {
+    public boolean eval(Map<String, ColumnStats> columnStatsMap) {
       for (Evaluator evaluator : evaluators) {
-        if (!evaluator.eval()) {
+        if (!evaluator.eval(columnStatsMap)) {
+          return false;
+        }
+      }
+      return true;
+    }
+
+    @Override
+    public boolean eval(Object[] values) {
+      for (Evaluator evaluator : evaluators) {
+        if (!evaluator.eval(values)) {
           return false;
         }
       }
@@ -439,9 +572,19 @@ public class ExpressionEvaluator {
     private Evaluator[] evaluators;
 
     @Override
-    public boolean eval() {
+    public boolean eval(Map<String, ColumnStats> columnStatsMap) {
       for (Evaluator evaluator : evaluators) {
-        if (evaluator.eval()) {
+        if (evaluator.eval(columnStatsMap)) {
+          return true;
+        }
+      }
+      return false;
+    }
+
+    @Override
+    public boolean eval(Object[] values) {
+      for (Evaluator evaluator : evaluators) {
+        if (evaluator.eval(values)) {
           return true;
         }
       }

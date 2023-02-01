@@ -41,6 +41,7 @@ import org.apache.hudi.sink.partitioner.profile.WriteProfiles;
 import org.apache.hudi.table.format.cdc.CdcInputSplit;
 import org.apache.hudi.table.format.mor.MergeOnReadInputSplit;
 import org.apache.hudi.util.ClusteringUtil;
+import org.apache.hudi.util.PartitionPruner;
 import org.apache.hudi.util.StreamerUtil;
 
 import org.apache.flink.annotation.VisibleForTesting;
@@ -95,6 +96,8 @@ public class IncrementalInputSplits implements Serializable {
   private final long maxCompactionMemoryInBytes;
   // for partition pruning
   private final Set<String> requiredPartitions;
+  // for incremental partition pruning which is used for streaming mode
+  private PartitionPruner partitionPruner;
   // skip compaction
   private final boolean skipCompaction;
   // skip clustering
@@ -106,6 +109,7 @@ public class IncrementalInputSplits implements Serializable {
       RowType rowType,
       long maxCompactionMemoryInBytes,
       @Nullable Set<String> requiredPartitions,
+      @Nullable PartitionPruner partitionPruner,
       boolean skipCompaction,
       boolean skipClustering) {
     this.conf = conf;
@@ -113,6 +117,7 @@ public class IncrementalInputSplits implements Serializable {
     this.rowType = rowType;
     this.maxCompactionMemoryInBytes = maxCompactionMemoryInBytes;
     this.requiredPartitions = requiredPartitions;
+    this.partitionPruner = partitionPruner;
     this.skipCompaction = skipCompaction;
     this.skipClustering = skipClustering;
   }
@@ -323,7 +328,7 @@ public class IncrementalInputSplits implements Serializable {
           ? mergeList(archivedMetadataList, activeMetadataList)
           : activeMetadataList;
 
-      readPartitions = getReadPartitions(metadataList);
+      readPartitions = getIncrementalReadPartitions(metadataList);
       if (readPartitions.size() == 0) {
         LOG.warn("No partitions found for reading under path: " + path);
         return Result.EMPTY;
@@ -444,6 +449,23 @@ public class IncrementalInputSplits implements Serializable {
           .filter(this.requiredPartitions::contains).collect(Collectors.toSet());
     }
     return partitions;
+  }
+
+  /**
+   * Returns the partitions to read with given metadata list.
+   * The partitions would be filtered by the partitions filters.
+   *
+   * @param metadataList The metadata list
+   * @return the set of read partitions
+   */
+  private Set<String> getIncrementalReadPartitions(List<HoodieCommitMetadata> metadataList) {
+    Set<String> partitions = HoodieInputFormatUtils.getWritePartitionPaths(metadataList);
+    // apply partition evaluators to do incremental partition prune
+    if (partitionPruner != null) {
+      return partitionPruner.apply(partitions);
+    } else {
+      return partitions;
+    }
   }
 
   /**
@@ -598,6 +620,8 @@ public class IncrementalInputSplits implements Serializable {
     private long maxCompactionMemoryInBytes;
     // for partition pruning
     private Set<String> requiredPartitions;
+    // for incremental partition pruning which is used for streaming mode
+    private PartitionPruner partitionPruner;
     // skip compaction
     private boolean skipCompaction = false;
     // skip clustering
@@ -631,6 +655,11 @@ public class IncrementalInputSplits implements Serializable {
       return this;
     }
 
+    public Builder partitionPruner(@Nullable PartitionPruner partitionPruner) {
+      this.partitionPruner = partitionPruner;
+      return this;
+    }
+
     public Builder skipCompaction(boolean skipCompaction) {
       this.skipCompaction = skipCompaction;
       return this;
@@ -644,7 +673,7 @@ public class IncrementalInputSplits implements Serializable {
     public IncrementalInputSplits build() {
       return new IncrementalInputSplits(
           Objects.requireNonNull(this.conf), Objects.requireNonNull(this.path), Objects.requireNonNull(this.rowType),
-          this.maxCompactionMemoryInBytes, this.requiredPartitions, this.skipCompaction, this.skipClustering);
+          this.maxCompactionMemoryInBytes, this.requiredPartitions, this.partitionPruner, this.skipCompaction, this.skipClustering);
     }
   }
 }
